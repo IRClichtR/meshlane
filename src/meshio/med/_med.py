@@ -230,21 +230,29 @@ def _read_families(fas_data):
     return families
 
 
-def write(filename, mesh):
+def write(filename, mesh, med_version="4.1.0", **kwargs):
     import h5py
 
     # MED doesn't support compression,
     # <https://github.com/nschloe/meshio/issues/781#issuecomment-616438066>
     # compression = None
+    # Si l'utilisateur précise la version qu'il veut utiliser on prend en compte, sinon on utilise la version 4.1.0 par défaut
 
+    try:
+        version_parts = [int(x) for x in med_version.split(".")]
+        maj = version_parts[0]
+        min = version_parts[1] if len(version_parts) > 1 else 0
+        rel = version_parts[2] if len(version_parts) > 2 else 0
+    except ValueError:
+        maj, min, rel = 4, 1, 0
     f = h5py.File(filename, "w")
 
     # Strangely the version must be 3.0.x
     # Any version >= 3.1.0 will NOT work with SALOME 8.3
     info = f.create_group("INFOS_GENERALES")
-    info.attrs.create("MAJ", 3)
-    info.attrs.create("MIN", 0)
-    info.attrs.create("REL", 0)
+    info.attrs.create("MAJ", maj)
+    info.attrs.create("MIN", min)
+    info.attrs.create("REL", rel)
 
     # Meshes
     mesh_ensemble = f.create_group("ENS_MAA")
