@@ -5,6 +5,14 @@ import pytest
 
 import meshio
 from meshio.med._med import numpy_to_med_type
+from meshio.med._med41 import (
+    FieldBitmaskWriter,
+    decode_entity_mask,
+    decode_geo_mask,
+    _bit_set,
+    _bit_test,
+)
+
 from . import helpers
 
 h5py = pytest.importorskip("h5py")
@@ -412,3 +420,186 @@ def test_med_version_default(tmp_path):
         assert int(info.attrs["MIN"]) == 1
         assert int(info.attrs["REL"]) == 0
 
+
+def test_bit_set():
+    """_bit_set positionne bien le bit à la bonne position."""
+    mask = np.uint32(0)
+    mask = _bit_set(mask, 0)  # bit 0 -> 0b00001 = 1
+    assert int(mask) == 1
+
+    mask = _bit_set(mask, 1)  # bit 1 -> 0b00011 = 3
+    assert int(mask) == 3
+
+    mask = _bit_set(mask, 3)  # bit 3 -> 0b01011 = 11
+    assert int(mask) == 11
+
+
+def test_bit_test():
+    """_bit_test détecte bien si un bit est positionné."""
+    mask = np.uint32(0b00101)  # bits 0 et 2 activés
+    assert _bit_test(mask, 0) is True
+    assert _bit_test(mask, 1) is False
+    assert _bit_test(mask, 2) is True
+    assert _bit_test(mask, 3) is False
+
+
+def test_decode_entity_mask_empty():
+    """Un masque à 0 ne donne aucune entité."""
+    result = decode_entity_mask(np.uint32(0))
+    assert result == []
+
+
+def test_decode_entity_mask_node():
+    """Bit 3 = MED_NODE."""
+    # MED_NODE est au bit 3 -> 0b001000 = 8
+    mask = np.uint32(0b001000)
+    result = decode_entity_mask(mask)
+    assert result == ["MED_NODE"]
+
+
+def test_decode_entity_mask_cell():
+    """Bit 0 = MED_CELL."""
+    mask = np.uint32(0b000001)
+    result = decode_entity_mask(mask)
+    assert result == ["MED_CELL"]
+
+
+def test_decode_entity_mask_multiple():
+    """Bits 0 et 3 = MED_CELL + MED_NODE."""
+    mask = np.uint32(0b001001)  # bits 0 et 3
+    result = decode_entity_mask(mask)
+    assert "MED_CELL" in result
+    assert "MED_NODE" in result
+    assert len(result) == 2
+
+
+def test_decode_geo_mask_triangle():
+    """MED_TRIA3 est à la position 4 dans MED_CELL."""
+    # MED_TRIA3 est le 5ème élément (index 4) de _GEO_ORDER["MED_CELL"]
+    # -> bit 4 -> 0b010000 = 16
+    mask = np.uint32(1 << 4)
+    result = decode_geo_mask("MED_CELL", mask)
+    assert result == ["MED_TRIA3"]
+
+
+def test_decode_geo_mask_empty():
+    """Un masque à 0 ne donne aucun type géométrique."""
+    result = decode_geo_mask("MED_CELL", np.uint32(0))
+    assert result == []
+
+
+def test_bitmask_writer_notify_node():
+    """
+    Après notify sur MED_NODE/MED_POINT1,
+    le masque global d'entité doit avoir le bit 3 activé.
+    """
+    writer = FieldBitmaskWriter()
+    step = "0000000000000000000100000000000000000001"
+    writer.notify("MED_NODE", "MED_NO_GEOTYPE", step)
+
+    # bit 3 = MED_NODE -> masque = 0b001000 = 8
+    assert _bit_test(writer._g_entity, 3)
+
+
+def test_bitmask_writer_notify_cell():
+    """
+    Après notify sur MED_CELL/MED_TRIA3,
+    le masque global d'entité doit avoir le bit 0 activé.
+    """
+    writer = FieldBitmaskWriter()
+    step = "0000000000000000000100000000000000000001"
+    writer.notify("MED_CELL", "MED_TRIA3", step)
+
+    # bit 0 = MED_CELL
+    assert _bit_test(writer._g_entity, 0)
+    # MED_TRIA3 est à l'index 4 dans MED_CELL
+    assert _bit_test(writer._g_geo["MED_CELL"], 4)
+
+
+def test_bitmask_writer_notify_multiple_steps():
+    """
+    Plusieurs pas de temps doivent être trackés séparément.
+    """
+    writer = FieldBitmaskWriter()
+    step1 = "0000000000000000000100000000000000000001"
+    step2 = "0000000000000000000200000000000000000002"
+
+    writer.notify("MED_NODE", "MED_NO_GEOTYPE", step1)
+    writer.notify("MED_CELL", "MED_TRIA3", step2)
+
+    # step1 : seulement MED_NODE (bit 3)
+    assert _bit_test(writer._s_entity[step1], 3)
+    assert not _bit_test(writer._s_entity[step1], 0)
+
+    # step2 : seulement MED_CELL (bit 0)
+    assert _bit_test(writer._s_entity[step2], 0)
+    assert not _bit_test(writer._s_entity[step2], 3)
+
+
+def test_bitmask_writer_flush(tmp_path):
+    """
+    flush() doit écrire les attributs LEN, LGN, LNA, LAA
+    dans le groupe HDF5 du champ.
+    """
+    import h5py
+
+    filename = tmp_path / "test_bitmask.med"
+    writer = FieldBitmaskWriter()
+    step = "0000000000000000000100000000000000000001"
+    writer.notify("MED_NODE", "MED_NO_GEOTYPE", step)
+
+    with h5py.File(filename, "w") as f:
+        field_grp = f.create_group("test_field")
+        field_grp.create_group(step)  # le step doit exister
+        writer.flush(field_grp)
+
+    with h5py.File(filename, "r") as f:
+        grp = f["test_field"]
+
+        # LEN = masque global des entités
+        assert "LEN" in grp.attrs
+        len_mask = np.uint32(int(grp.attrs["LEN"]))
+        assert _bit_test(len_mask, 3)  # MED_NODE = bit 3
+
+        # LGN = masque géo pour MED_NODE (doit être 0 car MED_NO_GEOTYPE)
+        # LNA = nombre de pas de temps où MED_NODE est présent
+        assert "LNA" in grp.attrs
+
+        # LAA = nombre de pas de temps où tous les types sont présents
+        assert "LAA" in grp.attrs
+        assert int(grp.attrs["LAA"]) == 1  # 1 seul pas de temps
+
+
+def test_bitmask_written_in_real_med_file(tmp_path):
+    """
+    Après un write meshio complet, le fichier .med doit contenir
+    les attributs de bitmask dans les champs CHA.
+    """
+    import h5py
+
+    filename = tmp_path / "test_bitmask_full.med"
+
+    # Mesh avec point_data
+    mesh = helpers.add_point_data(helpers.tri_mesh, 1)
+    meshio.med.write(filename, mesh)
+
+    with h5py.File(filename, "r") as f:
+        assert "CHA" in f
+        for field_name in f["CHA"]:
+            field_grp = f["CHA"][field_name]
+
+            # LEN doit exister
+            assert "LEN" in field_grp.attrs, (
+                f"Champ '{field_name}': attribut LEN manquant"
+            )
+
+            # LAA doit exister
+            assert "LAA" in field_grp.attrs, (
+                f"Champ '{field_name}': attribut LAA manquant"
+            )
+
+            # Le masque LEN doit avoir MED_NODE (bit 3) activé
+            len_mask = np.uint32(int(field_grp.attrs["LEN"]))
+            assert _bit_test(len_mask, 3), (
+                f"Champ '{field_name}': bit MED_NODE non activé dans LEN"
+            )
