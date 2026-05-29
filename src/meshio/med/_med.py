@@ -196,6 +196,41 @@ def read(filename):
 
 
 def _read_data(fields, profiles, cell_types, point_data, cell_data, field_data):
+    if "med:field_units" not in field_data:
+        field_data["med:field_units"] = {}
+        field_data["med:field_units"][name] = (
+        data.attrs.get("UNI", numpy_void_str),
+        data.attrs.get("UNT", numpy_void_str),
+    )
+
+    if "med:step_meta" not in field_data:
+        field_data["med:step_meta"] = {}
+        field_data["med:step_meta"][name] = []
+
+    # REMPLACER le bloc time_step :
+    time_step = sorted(data.keys())
+    if len(time_step) == 1:
+        names = [name]
+        key = time_step[0]
+        med_data = data[key]
+        field_data["med:step_meta"][name].append({
+            "ndt": med_data.attrs.get("NDT", 0),
+            "nor": med_data.attrs.get("NOR", -1),
+            "pdt": med_data.attrs["PDT"],
+            "key": key,
+        })
+    else:
+        names = []
+        for i, key in enumerate(time_step):
+            med_data = data[key]
+            t = med_data.attrs["PDT"]
+            field_data["med:step_meta"][name].append({
+                "ndt": med_data.attrs.get("NDT", i),
+                "nor": med_data.attrs.get("NOR", -1),
+                "pdt": t,
+                "key": key,
+            })
+            names.append(name + f"[{i:d}] - {t:g}")
     for name, data in fields.items():
         if "NOM" in data.attrs:
             if "med:nom" not in field_data:
