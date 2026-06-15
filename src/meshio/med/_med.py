@@ -77,10 +77,13 @@ med_type_to_entity = {
 }
 
 def _parse_med_field_name(name):
-    """Décompose 'Temperature[2] - 0.5' en ('Temperature', 2, 0.5)."""
+    """Parse 'Temperature[2] - 0.5' into ('Temperature', 2, 0.5)."""
     m = re.match(r"(.+)\[(\d+)\]\s*-\s*([0-9.eE+-]+)$", name)
     if m:
-        return m.group(1), int(m.group(2)), float(m.group(3))
+        try:
+            return m.group(1), int(m.group(2)), float(m.group(3))
+        except ValueError:
+            pass
     return name, None, None
 
 def read(filename):
@@ -500,12 +503,12 @@ def write(filename, mesh, med_version="4.1.0", **kwargs):
 
         tracker = FieldBitmaskWriter()
 
-        meta_list = step_meta.get(base_name, [])   # ← nouveau
+        meta_list = step_meta.get(base_name, [])
         for i, (idx, pdt_orig, data) in enumerate(entries):
-            meta = meta_list[i] if i < len(meta_list) else {}  # ← nouveau
-            ndt = meta.get("ndt", i + 1)                       # ← réel
-            nor = meta.get("nor", -1)                          # ← réel
-            pdt = meta.get("pdt", pdt_orig if pdt_orig is not None else 0.0)  # ← réel
+            meta = meta_list[i] if i < len(meta_list) else {}
+            ndt = meta.get("ndt", i + 1)
+            nor = meta.get("nor", -1)
+            pdt = meta.get("pdt", pdt_orig if pdt_orig is not None else 0.0)
             step_name = f"{ndt:020d}{nor:020d}"
             if step_name not in field:
                 ts = field.create_group(step_name)
@@ -566,6 +569,7 @@ def write(filename, mesh, med_version="4.1.0", **kwargs):
 
         tracker = FieldBitmaskWriter()
 
+        meta_list = step_meta.get(base_name, [])
         for i, (idx, pdt_orig, cell_type, data) in enumerate(entries):
             if data.dtype == object:
                 continue
@@ -579,9 +583,10 @@ def write(filename, mesh, med_version="4.1.0", **kwargs):
             else:
                 supp = "ELEM"
 
-            ndt = i + 1
-            nor = -1
-            pdt = pdt_orig if pdt_orig is not None else 0.0
+            meta = meta_list[i] if i < len(meta_list) else {}
+            ndt = meta.get("ndt", i + 1)
+            nor = meta.get("nor", -1)
+            pdt = meta.get("pdt", pdt_orig if pdt_orig is not None else 0.0)
             step_name = f"{ndt:020d}{nor:020d}"
 
             if step_name not in field:
