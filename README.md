@@ -69,25 +69,23 @@ CGNS, H5M, MED and XDMF formats. By default only numpy is needed.)
 
 ## Usage
 
-> **Note:** the import name is still `meshio` while the package rename is in progress.
-
 Command line:
 
 ```sh
-meshio convert    input.msh output.vtk   # convert between two formats
-meshio info       input.xdmf             # show some info about the mesh
-meshio compress   input.vtu              # compress the mesh file
-meshio decompress input.vtu              # decompress the mesh file
-meshio binary     input.msh              # convert to binary format
-meshio ascii      input.msh              # convert to ASCII format
+meshlane convert    input.msh output.vtk   # convert between two formats
+meshlane info       input.xdmf             # show some info about the mesh
+meshlane compress   input.vtu              # compress the mesh file
+meshlane decompress input.vtu              # decompress the mesh file
+meshlane binary     input.msh              # convert to binary format
+meshlane ascii      input.msh              # convert to ASCII format
 ```
 
 In Python, read a mesh:
 
 ```python
-import meshio
+import meshlane
 
-mesh = meshio.read(
+mesh = meshlane.read(
     filename,                # path, os.PathLike, or a buffer/open file
     # file_format="stl",     # optional; inferred from the extension
 )
@@ -97,7 +95,7 @@ mesh = meshio.read(
 Write a mesh:
 
 ```python
-import meshio
+import meshlane
 
 points = [
     [0.0, 0.0], [1.0, 0.0], [0.0, 1.0],
@@ -108,7 +106,7 @@ cells = [
     ("quad", [[1, 4, 5, 3]]),
 ]
 
-mesh = meshio.Mesh(
+mesh = meshlane.Mesh(
     points,
     cells,
     point_data={"T": [0.3, -1.2, 0.5, 0.7, 0.0, -3.0]},
@@ -117,7 +115,7 @@ mesh = meshio.Mesh(
 mesh.write("foo.vtk")
 
 # Or, equivalently:
-meshio.write_points_cells("foo.vtk", points, cells)
+meshlane.write_points_cells("foo.vtk", points, cells)
 ```
 
 For both reading and writing you may pass `file_format=` explicitly (e.g. to force
@@ -129,14 +127,14 @@ The [XDMF format](https://xdmf.org/index.php/XDMF_Model_and_Format) supports tim
 series sharing one mesh:
 
 ```python
-with meshio.xdmf.TimeSeriesWriter(filename) as writer:
+with meshlane.xdmf.TimeSeriesWriter(filename) as writer:
     writer.write_points_cells(points, cells)
     for t in [0.0, 0.1, 0.21]:
         writer.write_data(t, point_data={"phi": data})
 ```
 
 ```python
-with meshio.xdmf.TimeSeriesReader(filename) as reader:
+with meshlane.xdmf.TimeSeriesReader(filename) as reader:
     points, cells = reader.read_points_cells()
     for k in range(reader.num_steps):
         t, point_data, cell_data = reader.read_data(k)
