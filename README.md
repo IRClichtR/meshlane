@@ -1,6 +1,6 @@
 <h1 align="center">meshlane</h1>
 
-<p align="center">I/O for mesh files - convert smoothly between many formats.</p>
+<p align="center">I/O for mesh files: convert smoothly between many formats.</p>
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE.txt)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg?style=flat-square)](https://github.com/psf/black)
@@ -48,9 +48,9 @@ and writes all of the following and converts smoothly between them:
 
 ## What meshlane adds over meshio
 
-- **OpenFOAM polyMesh reader** - ASCII and binary, arbitrary cell types (tri / quad / polyhedra).
+- **OpenFOAM polyMesh reader**: ASCII and binary, arbitrary cell types (tri / quad / polyhedra).
 - **Ansys/APDL input** reader (`.inp`) for FEA interoperability benchmarks.
-- **MED/Salome improvements** - multi-mesh files, polygon cell support, more robust
+- **MED/Salome improvements**: multi-mesh files, polygon cell support, more robust
   Code_Aster round-trips and field/group handling.
 - Encoding and parsing robustness fixes (Latin-1 metadata, group name parsing).
 
@@ -164,9 +164,18 @@ tox
 
 meshlane is a fork of [meshio](https://github.com/nschloe/meshio). We kept the full
 git history and authorship so the original work remains properly attributed. We
-started a separate project - rather than only contributing upstream - to move faster
+started a separate project, rather than only contributing upstream, to move faster
 on the FEA/CFD interoperability features we need (Code_Aster, Ansys, OpenFOAM,
 Salome/MED) and to maintain them under active development.
+
+meshio is no longer actively maintained. [Simvia](https://simvia.tech) is a company
+willing to commit time and people to keep this project alive and moving forward.
+
+## Contributing
+
+Everyone is welcome, individuals and companies alike. If you want to help us keep
+meshlane maintained, we would be glad to have you on board. We will do our best to
+triage issues quickly and to give timely, constructive feedback on pull requests.
 
 Huge thanks to Nico Schlömer and all meshio contributors for the foundation this
 project is built on.
