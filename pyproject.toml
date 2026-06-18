@@ -3,8 +3,8 @@ requires = ["setuptools>=42", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "meshio"
-version = "5.3.5"
+name = "meshlane"
+version = "5.4.0"
 description = "I/O for many mesh formats"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -50,16 +50,16 @@ all = [
 ]
 
 [project.urls]
-homepage = "https://github.com/nschloe/meshio"
-code = "https://github.com/nschloe/meshio"
-issues = "https://github.com/nschloe/meshio/issues"
+homepage = "https://github.com/simvia-tech/meshlane"
+code = "https://github.com/simvia-tech/meshlane"
+issues = "https://github.com/simvia-tech/meshlane/issues"
 
 [project.entry-points.console_scripts]
-meshio = "meshio._cli:main"
+meshlane = "meshlane._cli:main"
 
 [tool.isort]
 profile = "black"
 
 # [options.data_files]
 # share/paraview-5.9/plugins =
-#     tools/paraview-meshio-plugin.py
+#     tools/paraview-meshlane-plugin.py
