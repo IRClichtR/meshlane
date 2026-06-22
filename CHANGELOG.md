@@ -6,6 +6,10 @@ fixes, enhancements etc., best follow [the meshio project on
 GitHub](https://github.com/nschloe/meshio). meshlane-specific changes are listed at the
 top; the meshio history follows below.
 
+## meshlane 5.4.1
+
+First deploy on pypi.org using github action.
+
 ## meshlane 5.4.0
 
 meshlane is a fork of meshio, maintained by Simvia. Breaking changes relative to the
