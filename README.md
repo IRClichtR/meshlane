@@ -1,10 +1,11 @@
 <h1 align="center">meshlane</h1>
 
-<p align="center"><img src="logo/meshlane.svg" width="400" style="max-width: 100%;" /></p>
+<p align="center"><img src="https://raw.githubusercontent.com/simvia-tech/meshlane/main/logo/meshlane.svg" width="400" style="max-width: 100%;" /></p>
 
 <p align="center">I/O for mesh files: convert smoothly between many formats.</p>
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE.txt)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://github.com/simvia-tech/meshlane/blob/main/LICENSE.txt)
+[![PyPI version](https://img.shields.io/pypi/v/meshlane.svg?style=flat-square)](https://pypi.org/project/meshlane/)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg?style=flat-square)](https://github.com/psf/black)
 
 > **meshlane** is an actively maintained descendant of
@@ -65,7 +66,18 @@ and writes all of the following and converts smoothly between them:
 
 ## Installation
 
-> **Note:** meshlane is not yet published on PyPI. Until then, install from source:
+meshlane is available [on PyPI](https://pypi.org/project/meshlane/):
+
+<!--pytest-codeblocks:skip-->
+
+```sh
+pip install meshlane[all]
+```
+
+(`[all]` pulls in the optional dependencies `netCDF4` and `h5py`, required for the
+CGNS, H5M, MED and XDMF formats. By default only numpy is needed.)
+
+To install from source instead:
 
 <!--pytest-codeblocks:skip-->
 
@@ -74,9 +86,6 @@ git clone https://github.com/simvia-tech/meshlane.git
 cd meshlane
 pip install -e .[all]
 ```
-
-(`[all]` pulls in the optional dependencies `netCDF4` and `h5py`, required for the
-CGNS, H5M, MED and XDMF formats. By default only numpy is needed.)
 
 ## Usage
 
@@ -191,5 +200,5 @@ project is built on.
 
 ## License
 
-meshlane is published under the [MIT license](LICENSE.txt), the same as meshio.
+meshlane is published under the [MIT license](https://github.com/simvia-tech/meshlane/blob/main/LICENSE.txt), the same as meshio.
 Copyright is retained by the original meshio authors and the meshlane contributors.
