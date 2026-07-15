@@ -52,6 +52,15 @@ _cgns_to_meshio_type = {
 NGON_N = 22
 NFACE_N = 23
 
+# Inverse of ``_cgns_to_meshio_type`` for the writer, restricted to the
+# fixed-size element types. The two variable-length "poly" types (NGON_n/
+# NFACE_n) are written through the dedicated polygon/polyhedron path instead.
+_meshio_to_cgns_type = {
+    meshio_type: (code, nodes_per_cell)
+    for code, (meshio_type, nodes_per_cell) in _cgns_to_meshio_type.items()
+    if nodes_per_cell is not None
+}
+
 
 def _read_attr(group, name):
     """Return an attribute that may carry a leading space (CGNS/ADF convention)."""
@@ -224,62 +233,210 @@ def read(filename):
     return Mesh(points, cells)
 
 
+def _create_node(parent, name, label):
+    """Create a CGNS node (an HDF5 group) carrying its ``label``/``name`` attrs."""
+    node = parent.create_group(name)
+    node.attrs["label"] = label
+    node.attrs["name"] = name
+    return node
+
+
+def _write_data(node, array, compression=None, compression_opts=None):
+    """Store an array in a node's ``" data"`` dataset (CGNS/ADF convention)."""
+    array = np.asarray(array)
+    # gzip needs chunked storage, which is impossible for an empty dataset.
+    if compression is not None and array.size == 0:
+        compression = None
+        compression_opts = None
+    node.create_dataset(
+        " data",
+        data=array,
+        compression=compression,
+        compression_opts=compression_opts,
+    )
+
+
+def _write_string_node(parent, name, label, text):
+    """Write a ``C1`` node whose ``" data"`` holds ``text`` as a char array."""
+    node = _create_node(parent, name, label)
+    _write_data(node, np.frombuffer(text.encode("ascii"), dtype=np.int8))
+    return node
+
+
+def _write_element_section(
+    zone,
+    name,
+    code,
+    elem_range,
+    connectivity,
+    offsets,
+    compression,
+    compression_opts,
+):
+    """Write one ``Elements_t`` section, mirroring what :func:`_read_elements` reads."""
+    section = _create_node(zone, name, "Elements_t")
+    # Elements_t " data" holds [ElementType, ElementSizeBoundary].
+    _write_data(section, np.array([code, 0], dtype=np.int32))
+
+    rng = _create_node(section, "ElementRange", "IndexRange_t")
+    _write_data(rng, np.asarray(elem_range, dtype=np.int32))
+
+    conn = _create_node(section, "ElementConnectivity", "DataArray_t")
+    _write_data(
+        conn, np.asarray(connectivity, dtype=np.int64), compression, compression_opts
+    )
+
+    if offsets is not None:
+        off = _create_node(section, "ElementStartOffset", "DataArray_t")
+        _write_data(
+            off, np.asarray(offsets, dtype=np.int64), compression, compression_opts
+        )
+
+
+def _write_polyhedra(zone, cells, next_start, compression, compression_opts):
+    """Write polyhedra as an NGON_n (faces) + NFACE_n (cells) section pair.
+
+    Each cell is a list (per face) of 0-based node-index arrays. Faces are laid
+    out flat in an NGON_n section and referenced by 1-based position from the
+    NFACE_n section, which is exactly how :func:`_resolve_polyhedra` reads them.
+    """
+    face_conn = []
+    face_offsets = [0]
+    cell_refs = []
+    cell_offsets = [0]
+
+    face_no = 0
+    for faces in cells:
+        for face in faces:
+            nodes = np.asarray(face, dtype=np.int64)
+            face_conn.append(nodes + 1)  # 1-based
+            face_offsets.append(face_offsets[-1] + nodes.size)
+            face_no += 1
+            cell_refs.append(face_no)  # 1-based face reference
+        cell_offsets.append(cell_offsets[-1] + len(faces))
+
+    n_faces = face_no
+    n_cells = len(cells)
+    ngon_conn = np.concatenate(face_conn) if face_conn else np.empty(0, np.int64)
+
+    _write_element_section(
+        zone,
+        "NGON_faces",
+        NGON_N,
+        [next_start, next_start + n_faces - 1],
+        ngon_conn,
+        np.asarray(face_offsets, dtype=np.int64),
+        compression,
+        compression_opts,
+    )
+    nface_start = next_start + n_faces
+    _write_element_section(
+        zone,
+        "NFACE_cells",
+        NFACE_N,
+        [nface_start, nface_start + n_cells - 1],
+        np.asarray(cell_refs, dtype=np.int64),
+        np.asarray(cell_offsets, dtype=np.int64),
+        compression,
+        compression_opts,
+    )
+
+
+def _write_elements(zone, mesh, compression, compression_opts):
+    """Write every cell block of ``mesh`` as CGNS ``Elements_t`` sections."""
+    next_start = 1  # 1-based CGNS element numbering
+    section_id = 0
+    polyhedra = []  # accumulated across all polyhedron blocks
+
+    for cell_block in mesh.cells:
+        ctype = cell_block.type
+        data = cell_block.data
+
+        if ctype.startswith("polyhedron"):
+            polyhedra.extend(data)
+            continue
+
+        if ctype == "polygon":
+            faces = [np.asarray(face, dtype=np.int64) for face in data]
+            offsets = np.concatenate([[0], np.cumsum([f.size for f in faces])])
+            conn = np.concatenate(faces) if faces else np.empty(0, np.int64)
+            n = len(faces)
+            section_id += 1
+            _write_element_section(
+                zone,
+                f"NGON_{section_id}",
+                NGON_N,
+                [next_start, next_start + n - 1],
+                conn + 1,  # 1-based
+                offsets,
+                compression,
+                compression_opts,
+            )
+            next_start += n
+            continue
+
+        info = _meshio_to_cgns_type.get(ctype)
+        if info is None:
+            warn(f'CGNS: unsupported cell type "{ctype}"; block skipped.')
+            continue
+        code, _ = info
+        arr = np.asarray(data, dtype=np.int64)
+        n = len(arr)
+        section_id += 1
+        _write_element_section(
+            zone,
+            f"{ctype}_{section_id}",
+            code,
+            [next_start, next_start + n - 1],
+            arr.reshape(-1) + 1,  # 1-based
+            None,
+            compression,
+            compression_opts,
+        )
+        next_start += n
+
+    if polyhedra:
+        _write_polyhedra(zone, polyhedra, next_start, compression, compression_opts)
+
+
 def write(filename, mesh, compression="gzip", compression_opts=4):
+    """Write an unstructured mesh to a CGNS/HDF5 file.
+
+    The layout mirrors what :func:`read` expects: every CGNS node is an HDF5
+    group carrying a ``label`` attribute, with payloads in ``" data"`` datasets
+    (note the leading space). Fixed-size element blocks become ``Elements_t``
+    sections; ``polygon`` blocks are written as ``NGON_n`` and ``polyhedron``
+    blocks as an ``NGON_n``/``NFACE_n`` pair.
+    """
     import h5py
 
-    f = h5py.File(filename, "w")
+    points = np.asarray(mesh.points, dtype=np.float64)
+    n_points, phys_dim = points.shape
+    cell_dim = max((cell_block.dim for cell_block in mesh.cells), default=phys_dim)
+    n_cells = sum(len(cell_block.data) for cell_block in mesh.cells)
 
-    base = f.create_group("Base")
+    with h5py.File(filename, "w") as f:
+        base = _create_node(f, "Base", "CGNSBase_t")
+        # CGNSBase_t " data" holds [CellDimension, PhysicalDimension].
+        _write_data(base, np.array([cell_dim, phys_dim], dtype=np.int32))
 
-    # TODO something is missing here
+        zone = _create_node(base, "Zone", "Zone_t")
+        # Zone_t " data" holds [[NVertex, NCell, NBoundVertex]] (unstructured).
+        _write_data(zone, np.array([[n_points, n_cells, 0]], dtype=np.int32))
+        _write_string_node(zone, "ZoneType", "ZoneType_t", "Unstructured")
 
-    zone1 = base.create_group("Zone1")
-    coords = zone1.create_group("GridCoordinates")
-
-    # write points
-    coord_x = coords.create_group("CoordinateX")
-    coord_x.create_dataset(
-        " data",
-        data=mesh.points[:, 0],
-        compression=compression,
-        compression_opts=compression_opts,
-    )
-    coord_y = coords.create_group("CoordinateY")
-    coord_y.create_dataset(
-        " data",
-        data=mesh.points[:, 1],
-        compression=compression,
-        compression_opts=compression_opts,
-    )
-    coord_z = coords.create_group("CoordinateZ")
-    coord_z.create_dataset(
-        " data",
-        data=mesh.points[:, 2],
-        compression=compression,
-        compression_opts=compression_opts,
-    )
-
-    # write cells
-    # TODO write cells other than tetra
-    elems = zone1.create_group("GridElements")
-    rnge = elems.create_group("ElementRange")
-    for cell_block in mesh.cells:
-        if cell_block.type == "tetra":
-            rnge.create_dataset(
-                " data",
-                data=[1, cell_block.data.shape[0]],
-                compression=compression,
-                compression_opts=compression_opts,
+        grid = _create_node(zone, "GridCoordinates", "GridCoordinates_t")
+        coord_names = ["CoordinateX", "CoordinateY", "CoordinateZ"]
+        for i in range(phys_dim):
+            coord = _create_node(grid, coord_names[i], "DataArray_t")
+            _write_data(
+                coord,
+                np.ascontiguousarray(points[:, i]),
+                compression,
+                compression_opts,
             )
-    conn = elems.create_group("ElementConnectivity")
-    for cell_block in mesh.cells:
-        if cell_block.type == "tetra":
-            conn.create_dataset(
-                " data",
-                data=cell_block.data.reshape(-1) + 1,
-                compression=compression,
-                compression_opts=compression_opts,
-            )
+
+        _write_elements(zone, mesh, compression, compression_opts)
 
 
 register_format("cgns", [".cgns"], read, {"cgns": write})
