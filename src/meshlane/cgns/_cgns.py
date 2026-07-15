@@ -18,7 +18,7 @@ import sys
 import numpy as np
 
 from .._common import warn
-from .._exceptions import ReadError
+from .._exceptions import ReadError, WriteError
 from .._helpers import register_format
 from .._mesh import Mesh
 
@@ -433,6 +433,11 @@ def _write_elements(zone, mesh, compression, compression_opts):
             polyhedra.extend(data)
             continue
 
+        # An empty block would produce a reversed ElementRange [start, start-1]
+        # (an invalid section); there is nothing to write, so skip it.
+        if len(data) == 0:
+            continue
+
         if ctype == "polygon":
             faces = [np.asarray(face, dtype=np.int64) for face in data]
             offsets = np.concatenate([[0], np.cumsum([f.size for f in faces])])
@@ -489,6 +494,10 @@ def write(filename, mesh, compression="gzip", compression_opts=4):
 
     points = np.asarray(mesh.points, dtype=np.float64)
     n_points, phys_dim = points.shape
+    if not 1 <= phys_dim <= 3:
+        raise WriteError(
+            f"CGNS: PhysicalDimension must be 1, 2 or 3; got {phys_dim}-D points."
+        )
     cell_dim = max((cell_block.dim for cell_block in mesh.cells), default=phys_dim)
     # CGNS CellSize counts only the top-dimensional (cell_dim) elements.
     n_cells = sum(
