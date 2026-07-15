@@ -13,6 +13,8 @@ References:
 - CGNS/HDF5 file mapping: https://cgns.github.io/standard/MLL/CGNS_MLL.html
 """
 
+import sys
+
 import numpy as np
 
 from .._common import warn
@@ -124,22 +126,24 @@ def _read_coordinates(zone, phys_dim):
     return np.column_stack(columns)
 
 
-def _resolve_polyhedra(cell_offsets, cell_faces, face_offsets, face_nodes):
+def _resolve_polyhedra(cell_offsets, cell_faces, face_offsets, face_nodes, face_start):
     """Build polyhedron cell blocks from NFACE_n cells and NGON_n faces.
 
-    Each NFACE_n cell lists signed 1-based face indices; the sign encodes face
-    orientation and is dropped. Each referenced NGON_n face lists 1-based node
-    indices. The result follows meshio's polyhedron layout: a list (per cell)
-    of lists (per face) of 0-based node-index arrays, grouped into
-    ``polyhedron{n}`` blocks by the cell's unique node count (as in the vtu
-    reader).
+    Each NFACE_n cell lists signed face references; the sign encodes face
+    orientation and is dropped, and the magnitude is the face's global CGNS
+    element number. ``face_start`` is the NGON_n section's first element number,
+    so ``abs(ref) - face_start`` is the face's 0-based position in that section.
+    Each referenced NGON_n face lists 1-based node indices. The result follows
+    meshio's polyhedron layout: a list (per cell) of lists (per face) of 0-based
+    node-index arrays, grouped into ``polyhedron{n}`` blocks by the cell's unique
+    node count (as in the vtu reader).
     """
     blocks = {}
     n_cells = len(cell_offsets) - 1
     for i in range(n_cells):
         faces = []
         for face_ref in cell_faces[cell_offsets[i] : cell_offsets[i + 1]]:
-            face_idx = abs(int(face_ref)) - 1
+            face_idx = abs(int(face_ref)) - face_start
             nodes = face_nodes[face_offsets[face_idx] : face_offsets[face_idx + 1]] - 1
             faces.append(nodes)
         n_unique = np.unique(np.concatenate(faces)).size
@@ -151,9 +155,10 @@ def _read_elements(zone):
     cells = []
 
     # NGON_n faces must be read before NFACE_n cells can be resolved, so keep
-    # their raw connectivity/offsets around for a second pass.
+    # their raw connectivity/offsets (and section start) around for a second pass.
     ngon_offsets = None
     ngon_conn = None
+    ngon_start = None
     nface_offsets = None
     nface_conn = None
 
@@ -177,6 +182,7 @@ def _read_elements(zone):
             ]
             cells.append(("polygon", polygons))
             ngon_offsets, ngon_conn = offsets, conn
+            ngon_start = int(_index_array(section["ElementRange"])[0])
         elif code == NFACE_N:
             nface_conn = _index_array(section["ElementConnectivity"])
             nface_offsets = _index_array(section["ElementStartOffset"])
@@ -192,7 +198,9 @@ def _read_elements(zone):
                 "CGNS: NFACE_n section found without an NGON_n section to resolve it."
             )
         cells.extend(
-            _resolve_polyhedra(nface_offsets, nface_conn, ngon_offsets, ngon_conn)
+            _resolve_polyhedra(
+                nface_offsets, nface_conn, ngon_offsets, ngon_conn, ngon_start
+            )
         )
 
     return cells
@@ -233,34 +241,97 @@ def read(filename):
     return Mesh(points, cells)
 
 
-def _create_node(parent, name, label):
-    """Create a CGNS node (an HDF5 group) carrying its ``label``/``name`` attrs."""
+# CGNS/HDF5 (ADF) data-type strings, stored in each node's ``type`` attribute,
+# and the numpy dtype each one maps to. ``MT`` marks a node that carries no data.
+_ADF_DTYPE = {
+    "I4": np.int32,
+    "I8": np.int64,
+    "R4": np.float32,
+    "R8": np.float64,
+    "C1": np.int8,
+}
+
+
+def _string_dtype(length):
+    """A fixed-length ASCII string dtype, as CGNS uses for name/label/type attrs."""
+    import h5py
+
+    return h5py.string_dtype(encoding="ascii", length=length)
+
+
+def _set_node_attrs(node, name, label, adf_type, with_flags=True):
+    """Attach the mandatory CGNS/HDF5 (ADF) attributes to a node.
+
+    Every ADF-H5 node carries ``name``/``label`` (fixed 33-char ASCII), a
+    ``type`` data-type string (fixed 3-char ASCII), and an int32 ``flags`` array.
+    The root node is the only one without ``flags``.
+    """
+    node.attrs.create("name", name.encode("ascii"), dtype=_string_dtype(33))
+    node.attrs.create("label", label.encode("ascii"), dtype=_string_dtype(33))
+    node.attrs.create("type", adf_type.encode("ascii"), dtype=_string_dtype(3))
+    if with_flags:
+        node.attrs.create("flags", np.array([1], dtype=np.int32))
+
+
+def _create_node(
+    parent,
+    name,
+    label,
+    adf_type="MT",
+    data=None,
+    compression=None,
+    compression_opts=None,
+):
+    """Create a CGNS node (an HDF5 group) with ADF attributes and optional data.
+
+    ``data`` is stored in the node's ``" data"`` dataset (note the leading space)
+    with the numpy dtype that matches ``adf_type``; ``MT`` nodes carry no data.
+    """
     node = parent.create_group(name)
-    node.attrs["label"] = label
-    node.attrs["name"] = name
+    _set_node_attrs(node, name, label, adf_type)
+    if adf_type != "MT" and data is not None:
+        array = np.asarray(data, dtype=_ADF_DTYPE[adf_type])
+        # gzip needs chunked storage, which is impossible for an empty dataset.
+        if compression is not None and array.size == 0:
+            compression = None
+            compression_opts = None
+        node.create_dataset(
+            " data",
+            data=array,
+            compression=compression,
+            compression_opts=compression_opts,
+        )
     return node
-
-
-def _write_data(node, array, compression=None, compression_opts=None):
-    """Store an array in a node's ``" data"`` dataset (CGNS/ADF convention)."""
-    array = np.asarray(array)
-    # gzip needs chunked storage, which is impossible for an empty dataset.
-    if compression is not None and array.size == 0:
-        compression = None
-        compression_opts = None
-    node.create_dataset(
-        " data",
-        data=array,
-        compression=compression,
-        compression_opts=compression_opts,
-    )
 
 
 def _write_string_node(parent, name, label, text):
     """Write a ``C1`` node whose ``" data"`` holds ``text`` as a char array."""
-    node = _create_node(parent, name, label)
-    _write_data(node, np.frombuffer(text.encode("ascii"), dtype=np.int8))
-    return node
+    return _create_node(parent, name, label, "C1", list(text.encode("ascii")))
+
+
+def _init_root(f):
+    """Write the CGNS/HDF5 root metadata required by the CGNS library.
+
+    This is what makes the file a *conformant* CGNS/HDF5 file (accepted by
+    ``cgnscheck``/cgio): the root node attributes, the ``" format"`` and
+    ``" hdf5version"`` datasets, and the ``CGNSLibraryVersion`` node.
+    """
+    import h5py
+
+    _set_node_attrs(
+        f, "HDF5 MotherNode", "Root Node of HDF5 File", "MT", with_flags=False
+    )
+    # The " format" node tells cgio the byte order of the data on disk, which
+    # numpy/h5py write in the host's native order.
+    data_format = "IEEE_BIG_32" if sys.byteorder == "big" else "IEEE_LITTLE_32"
+    f.create_dataset(
+        " format",
+        data=np.frombuffer((data_format + "\x00").encode("ascii"), dtype=np.int8),
+    )
+    version = f"HDF5 Version {h5py.version.hdf5_version}".encode("ascii")
+    version = version.ljust(33, b"\x00")[:33]
+    f.create_dataset(" hdf5version", data=np.frombuffer(version, dtype=np.int8))
+    _create_node(f, "CGNSLibraryVersion", "CGNSLibraryVersion_t", "R4", [3.4])
 
 
 def _write_element_section(
@@ -274,22 +345,27 @@ def _write_element_section(
     compression_opts,
 ):
     """Write one ``Elements_t`` section, mirroring what :func:`_read_elements` reads."""
-    section = _create_node(zone, name, "Elements_t")
     # Elements_t " data" holds [ElementType, ElementSizeBoundary].
-    _write_data(section, np.array([code, 0], dtype=np.int32))
-
-    rng = _create_node(section, "ElementRange", "IndexRange_t")
-    _write_data(rng, np.asarray(elem_range, dtype=np.int32))
-
-    conn = _create_node(section, "ElementConnectivity", "DataArray_t")
-    _write_data(
-        conn, np.asarray(connectivity, dtype=np.int64), compression, compression_opts
+    section = _create_node(zone, name, "Elements_t", "I4", [code, 0])
+    _create_node(section, "ElementRange", "IndexRange_t", "I8", elem_range)
+    _create_node(
+        section,
+        "ElementConnectivity",
+        "DataArray_t",
+        "I8",
+        connectivity,
+        compression,
+        compression_opts,
     )
-
     if offsets is not None:
-        off = _create_node(section, "ElementStartOffset", "DataArray_t")
-        _write_data(
-            off, np.asarray(offsets, dtype=np.int64), compression, compression_opts
+        _create_node(
+            section,
+            "ElementStartOffset",
+            "DataArray_t",
+            "I8",
+            offsets,
+            compression,
+            compression_opts,
         )
 
 
@@ -297,8 +373,9 @@ def _write_polyhedra(zone, cells, next_start, compression, compression_opts):
     """Write polyhedra as an NGON_n (faces) + NFACE_n (cells) section pair.
 
     Each cell is a list (per face) of 0-based node-index arrays. Faces are laid
-    out flat in an NGON_n section and referenced by 1-based position from the
-    NFACE_n section, which is exactly how :func:`_resolve_polyhedra` reads them.
+    out flat in an NGON_n section starting at element number ``next_start`` and
+    referenced from the NFACE_n section by their global CGNS element number,
+    which is exactly how :func:`_resolve_polyhedra` reads them.
     """
     face_conn = []
     face_offsets = [0]
@@ -309,10 +386,10 @@ def _write_polyhedra(zone, cells, next_start, compression, compression_opts):
     for faces in cells:
         for face in faces:
             nodes = np.asarray(face, dtype=np.int64)
-            face_conn.append(nodes + 1)  # 1-based
+            face_conn.append(nodes + 1)  # 1-based node indices
             face_offsets.append(face_offsets[-1] + nodes.size)
+            cell_refs.append(next_start + face_no)  # global face element number
             face_no += 1
-            cell_refs.append(face_no)  # 1-based face reference
         cell_offsets.append(cell_offsets[-1] + len(faces))
 
     n_faces = face_no
@@ -413,24 +490,30 @@ def write(filename, mesh, compression="gzip", compression_opts=4):
     points = np.asarray(mesh.points, dtype=np.float64)
     n_points, phys_dim = points.shape
     cell_dim = max((cell_block.dim for cell_block in mesh.cells), default=phys_dim)
-    n_cells = sum(len(cell_block.data) for cell_block in mesh.cells)
+    # CGNS CellSize counts only the top-dimensional (cell_dim) elements.
+    n_cells = sum(
+        len(cell_block.data) for cell_block in mesh.cells if cell_block.dim == cell_dim
+    )
 
     with h5py.File(filename, "w") as f:
-        base = _create_node(f, "Base", "CGNSBase_t")
-        # CGNSBase_t " data" holds [CellDimension, PhysicalDimension].
-        _write_data(base, np.array([cell_dim, phys_dim], dtype=np.int32))
+        _init_root(f)
 
-        zone = _create_node(base, "Zone", "Zone_t")
-        # Zone_t " data" holds [[NVertex, NCell, NBoundVertex]] (unstructured).
-        _write_data(zone, np.array([[n_points, n_cells, 0]], dtype=np.int32))
+        # CGNSBase_t " data" holds [CellDimension, PhysicalDimension].
+        base = _create_node(f, "Base", "CGNSBase_t", "I4", [cell_dim, phys_dim])
+
+        # Zone_t " data" holds [NVertex, NCell, NBoundVertex] with CGNS shape
+        # [IndexDimension=1][3], which cgio stores (dims reversed) as HDF5 (3, 1).
+        zone = _create_node(base, "Zone", "Zone_t", "I4", [[n_points], [n_cells], [0]])
         _write_string_node(zone, "ZoneType", "ZoneType_t", "Unstructured")
 
         grid = _create_node(zone, "GridCoordinates", "GridCoordinates_t")
         coord_names = ["CoordinateX", "CoordinateY", "CoordinateZ"]
         for i in range(phys_dim):
-            coord = _create_node(grid, coord_names[i], "DataArray_t")
-            _write_data(
-                coord,
+            _create_node(
+                grid,
+                coord_names[i],
+                "DataArray_t",
+                "R8",
                 np.ascontiguousarray(points[:, i]),
                 compression,
                 compression_opts,
