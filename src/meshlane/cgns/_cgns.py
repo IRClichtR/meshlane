@@ -330,7 +330,9 @@ def _init_root(f):
     version = f"HDF5 Version {h5py.version.hdf5_version}".encode("ascii")
     version = version.ljust(33, b"\x00")[:33]
     f.create_dataset(" hdf5version", data=np.frombuffer(version, dtype=np.int8))
-    _create_node(f, "CGNSLibraryVersion", "CGNSLibraryVersion_t", "R4", [3.4])
+    # The polygon/polyhedron sections use ElementStartOffset (CPEX0031), which is
+    # part of the CGNS standard from version 4.0, so the file must declare >= 4.0.
+    _create_node(f, "CGNSLibraryVersion", "CGNSLibraryVersion_t", "R4", [4.0])
 
 
 def _write_element_section(
