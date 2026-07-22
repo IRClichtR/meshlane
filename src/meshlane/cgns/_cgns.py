@@ -126,26 +126,25 @@ def _read_coordinates(zone, phys_dim):
     return np.column_stack(columns)
 
 
-def _resolve_polyhedra(cell_offsets, cell_faces, face_offsets, face_nodes, face_start):
+def _resolve_polyhedra(cell_offsets, cell_faces, faces_by_number):
     """Build polyhedron cell blocks from NFACE_n cells and NGON_n faces.
 
     Each NFACE_n cell lists signed face references; the sign encodes face
     orientation and is dropped, and the magnitude is the face's global CGNS
-    element number. ``face_start`` is the NGON_n section's first element number,
-    so ``abs(ref) - face_start`` is the face's 0-based position in that section.
-    Each referenced NGON_n face lists 1-based node indices. The result follows
-    meshio's polyhedron layout: a list (per cell) of lists (per face) of 0-based
-    node-index arrays, grouped into ``polyhedron{n}`` blocks by the cell's unique
-    node count (as in the vtu reader).
+    element number. ``faces_by_number`` maps that global number to the face's
+    0-based node-index array, collected from every NGON_n section, so faces
+    referenced across more than one NGON_n section all resolve. The result
+    follows meshio's polyhedron layout: a list (per cell) of lists (per face) of
+    0-based node-index arrays, grouped into ``polyhedron{n}`` blocks by the
+    cell's unique node count (as in the vtu reader).
     """
     blocks = {}
     n_cells = len(cell_offsets) - 1
     for i in range(n_cells):
-        faces = []
-        for face_ref in cell_faces[cell_offsets[i] : cell_offsets[i + 1]]:
-            face_idx = abs(int(face_ref)) - face_start
-            nodes = face_nodes[face_offsets[face_idx] : face_offsets[face_idx + 1]] - 1
-            faces.append(nodes)
+        faces = [
+            faces_by_number[abs(int(face_ref))]
+            for face_ref in cell_faces[cell_offsets[i] : cell_offsets[i + 1]]
+        ]
         n_unique = np.unique(np.concatenate(faces)).size
         blocks.setdefault(f"polyhedron{n_unique}", []).append(faces)
     return list(blocks.items())
@@ -154,11 +153,11 @@ def _resolve_polyhedra(cell_offsets, cell_faces, face_offsets, face_nodes, face_
 def _read_elements(zone):
     cells = []
 
-    # NGON_n faces must be read before NFACE_n cells can be resolved, so keep
-    # their raw connectivity/offsets (and section start) around for a second pass.
-    ngon_offsets = None
-    ngon_conn = None
-    ngon_start = None
+    # NGON_n faces must be read before NFACE_n cells can be resolved. Collect
+    # every NGON_n face keyed by its global CGNS element number so NFACE_n cells
+    # (which reference faces by that number) resolve even when the faces are
+    # spread across more than one NGON_n section.
+    faces_by_number = {}
     nface_offsets = None
     nface_conn = None
 
@@ -177,12 +176,15 @@ def _read_elements(zone):
         if code == NGON_N:
             conn = _index_array(section["ElementConnectivity"])
             offsets = _index_array(section["ElementStartOffset"])
+            start = int(_index_array(section["ElementRange"])[0])
             polygons = [
                 conn[offsets[i] : offsets[i + 1]] - 1 for i in range(len(offsets) - 1)
             ]
             cells.append(("polygon", polygons))
-            ngon_offsets, ngon_conn = offsets, conn
-            ngon_start = int(_index_array(section["ElementRange"])[0])
+            # Register each face under its global element number so NFACE_n cells
+            # can reference it, whichever NGON_n section it lives in.
+            for i, polygon in enumerate(polygons):
+                faces_by_number[start + i] = polygon
         elif code == NFACE_N:
             nface_conn = _index_array(section["ElementConnectivity"])
             nface_offsets = _index_array(section["ElementStartOffset"])
@@ -193,15 +195,11 @@ def _read_elements(zone):
             cells.append((meshio_type, conn.reshape(n_cells, nodes_per_cell) - 1))
 
     if nface_offsets is not None:
-        if ngon_offsets is None:
+        if not faces_by_number:
             raise ReadError(
                 "CGNS: NFACE_n section found without an NGON_n section to resolve it."
             )
-        cells.extend(
-            _resolve_polyhedra(
-                nface_offsets, nface_conn, ngon_offsets, ngon_conn, ngon_start
-            )
-        )
+        cells.extend(_resolve_polyhedra(nface_offsets, nface_conn, faces_by_number))
 
     return cells
 
@@ -216,6 +214,7 @@ def read(filename):
     - Exactly one base and one zone are read: the first ``CGNSBase_t`` node and,
       within it, the first ``Zone_t`` node. Additional bases or zones are
       ignored.
+      - BC_t and Family_t are ignored in that first iteration.
     """
     import h5py
 
@@ -369,44 +368,88 @@ def _write_element_section(
         )
 
 
-def _write_polyhedra(zone, cells, next_start, compression, compression_opts):
-    """Write polyhedra as an NGON_n (faces) + NFACE_n (cells) section pair.
+def _face_key(nodes):
+    """A face's identity as an order-independent tuple of 0-based node indices,
+    used to match a polyhedron face against the polygon faces already written."""
+    return tuple(sorted(int(n) for n in nodes))
 
-    Each cell is a list (per face) of 0-based node-index arrays. Faces are laid
-    out flat in an NGON_n section starting at element number ``next_start`` and
-    referenced from the NFACE_n section by their global CGNS element number,
-    which is exactly how :func:`_resolve_polyhedra` reads them.
+
+def _face_orientation(canon, face):
+    """Sign of an NFACE_n reference: ``+1`` if ``face`` traverses its nodes in the
+    same cyclic order as the stored (canonical) face ``canon``, ``-1`` if
+    reversed. Faces with fewer than three nodes carry no orientation (``+1``)."""
+    n = len(canon)
+    if n < 3:
+        return 1
+    canon = [int(x) for x in canon]
+    face = [int(x) for x in face]
+    try:
+        pos = face.index(canon[0])
+    except ValueError:
+        return 1
+    return 1 if face[(pos + 1) % n] == canon[1] else -1
+
+
+def _write_polyhedra(zone, cells, face_map, next_start, compression, compression_opts):
+    """Write polyhedra as an NFACE_n section referencing shared NGON_n faces.
+
+    Each cell is a list (per face) of 0-based node-index arrays. Every face is
+    matched against ``face_map`` (built from the polygon blocks already written,
+    and extended here as new faces appear) so a face is stored only once. Faces
+    that no polygon block provides are appended to a single trailing NGON_n
+    section starting at element number ``next_start``. Each NFACE_n reference is
+    the face's signed global CGNS element number: the sign encodes orientation
+    relative to the stored face, and the magnitude is what
+    :func:`_resolve_polyhedra` reads back.
     """
-    face_conn = []
-    face_offsets = [0]
+    extra_conn = []  # 1-based node indices of faces not in any polygon block
+    extra_offsets = [0]
+    extra_next = next_start  # global element number of the next new face
+
     cell_refs = []
     cell_offsets = [0]
+    signs_used = {}  # global face number -> signs already emitted for it
 
-    face_no = 0
     for faces in cells:
         for face in faces:
             nodes = np.asarray(face, dtype=np.int64)
-            face_conn.append(nodes + 1)  # 1-based node indices
-            face_offsets.append(face_offsets[-1] + nodes.size)
-            cell_refs.append(next_start + face_no)  # global face element number
-            face_no += 1
+            entry = face_map.get(_face_key(nodes))
+            if entry is None:
+                # A face no polygon block provides: emit it once here.
+                extra_conn.append(nodes + 1)  # 1-based node indices
+                extra_offsets.append(extra_offsets[-1] + nodes.size)
+                entry = (extra_next, nodes)
+                face_map[_face_key(nodes)] = entry
+                extra_next += 1
+            global_no, canon = entry
+            # A face bounds at most two cells and must appear with opposite signs
+            # (the CGNS NFACE_n convention that cgnscheck enforces). Orientation
+            # is lost on read, so derive the signs from usage: keep the geometric
+            # sign while it is free, otherwise flip it for the neighbour cell.
+            sign = _face_orientation(canon, nodes)
+            seen = signs_used.setdefault(global_no, set())
+            if sign in seen:
+                sign = -sign
+            seen.add(sign)
+            cell_refs.append(sign * global_no)
         cell_offsets.append(cell_offsets[-1] + len(faces))
 
-    n_faces = face_no
-    n_cells = len(cells)
-    ngon_conn = np.concatenate(face_conn) if face_conn else np.empty(0, np.int64)
+    n_extra = extra_next - next_start
+    if n_extra > 0:
+        ngon_conn = np.concatenate(extra_conn) if extra_conn else np.empty(0, np.int64)
+        _write_element_section(
+            zone,
+            "NGON_faces",
+            NGON_N,
+            [next_start, next_start + n_extra - 1],
+            ngon_conn,
+            np.asarray(extra_offsets, dtype=np.int64),
+            compression,
+            compression_opts,
+        )
 
-    _write_element_section(
-        zone,
-        "NGON_faces",
-        NGON_N,
-        [next_start, next_start + n_faces - 1],
-        ngon_conn,
-        np.asarray(face_offsets, dtype=np.int64),
-        compression,
-        compression_opts,
-    )
-    nface_start = next_start + n_faces
+    n_cells = len(cells)
+    nface_start = next_start + n_extra
     _write_element_section(
         zone,
         "NFACE_cells",
@@ -420,10 +463,20 @@ def _write_polyhedra(zone, cells, next_start, compression, compression_opts):
 
 
 def _write_elements(zone, mesh, compression, compression_opts):
-    """Write every cell block of ``mesh`` as CGNS ``Elements_t`` sections."""
+    """Write every cell block of ``mesh`` as CGNS ``Elements_t`` sections.
+
+    Polyhedra reference the polygon faces already written as NGON_n sections (by
+    global CGNS element number) instead of duplicating them, so a mesh whose
+    polyhedra are built from its polygon block round-trips without gaining
+    phantom polygon cells. Faces that no polygon block provides are written once
+    to a trailing NGON_n section (see :func:`_write_polyhedra`).
+    """
     next_start = 1  # 1-based CGNS element numbering
     section_id = 0
     polyhedra = []  # accumulated across all polyhedron blocks
+    # Maps a face's node set to (global CGNS element number, canonical node
+    # order) so polyhedra can reference existing polygon faces.
+    face_map = {}
 
     for cell_block in mesh.cells:
         ctype = cell_block.type
@@ -454,6 +507,9 @@ def _write_elements(zone, mesh, compression, compression_opts):
                 compression,
                 compression_opts,
             )
+            # Register each polygon so polyhedra can reference it by element number.
+            for i, face in enumerate(faces):
+                face_map.setdefault(_face_key(face), (next_start + i, face))
             next_start += n
             continue
 
@@ -478,17 +534,21 @@ def _write_elements(zone, mesh, compression, compression_opts):
         next_start += n
 
     if polyhedra:
-        _write_polyhedra(zone, polyhedra, next_start, compression, compression_opts)
+        _write_polyhedra(
+            zone, polyhedra, face_map, next_start, compression, compression_opts
+        )
 
 
 def write(filename, mesh, compression="gzip", compression_opts=4):
-    """Write an unstructured mesh to a CGNS/HDF5 file.
+    """Write an unstructured mesh to a conformant CGNS/HDF5 file.
 
-    The layout mirrors what :func:`read` expects: every CGNS node is an HDF5
-    group carrying a ``label`` attribute, with payloads in ``" data"`` datasets
-    (note the leading space). Fixed-size element blocks become ``Elements_t``
-    sections; ``polygon`` blocks are written as ``NGON_n`` and ``polyhedron``
-    blocks as an ``NGON_n``/``NFACE_n`` pair.
+    The output follows the full CGNS/HDF5 (ADF-on-HDF5) encoding accepted by the
+    CGNS library (``cgnscheck``): the root metadata (:func:`_init_root`) plus, on
+    every node, the mandatory ``name``/``label``/``type``/``flags`` attributes and
+    a ``" data"`` dataset (note the leading space) whose dtype matches ``type``.
+    Fixed-size element blocks become ``Elements_t`` sections; ``polygon`` blocks
+    are written as ``NGON_n`` and ``polyhedron`` blocks as an
+    ``NGON_n``/``NFACE_n`` pair.
     """
     import h5py
 
